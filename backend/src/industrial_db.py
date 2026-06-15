@@ -161,13 +161,15 @@ def clean_sensor_data(df, machine_id=None):
 
     return df, quality_report
 
-def generate_historical_data(hours=24, interval_minutes=5, dirty_ratio=0.0):
+def generate_historical_data(hours=24, interval_minutes=5, dirty_ratio=0.0,
+                             purity_start_level=None, purity_trend=0.0):
     data_dir = os.path.join(os.path.dirname(__file__), '..', 'data')
     os.makedirs(data_dir, exist_ok=True)
 
     end_time = datetime.now()
     start_time = end_time - timedelta(hours=hours)
     time_index = pd.date_range(start=start_time, end=end_time, freq=f'{interval_minutes}min')
+    n = len(time_index)
 
     all_data = []
 
@@ -177,10 +179,10 @@ def generate_historical_data(hours=24, interval_minutes=5, dirty_ratio=0.0):
         base_airflow = np.random.uniform(1300, 1700)
         base_amplitude = np.random.uniform(1.5, 2.2)
 
-        freq_noise = np.random.normal(0, 0.8, len(time_index))
-        angle_noise = np.random.normal(0, 0.3, len(time_index))
-        airflow_noise = np.random.normal(0, 80, len(time_index))
-        amplitude_noise = np.random.normal(0, 0.15, len(time_index))
+        freq_noise = np.random.normal(0, 0.8, n)
+        angle_noise = np.random.normal(0, 0.3, n)
+        airflow_noise = np.random.normal(0, 80, n)
+        amplitude_noise = np.random.normal(0, 0.15, n)
 
         vibration_freq = np.clip(base_freq + freq_noise, *PARAM_RANGES['vibration_freq'])
         inclination_angle = np.clip(base_angle + angle_noise, *PARAM_RANGES['inclination_angle'])
@@ -190,9 +192,20 @@ def generate_historical_data(hours=24, interval_minutes=5, dirty_ratio=0.0):
         ideal_amplitude = 1.8 + 0.05 * (vibration_freq - 50) - 0.1 * (inclination_angle - 3.5) + 0.0003 * (fan_airflow - 1500)
         amplitude_deviation = np.abs(amplitude - ideal_amplitude)
 
-        base_purity = 99.5
-        purity_loss = amplitude_deviation * 1.2 + np.random.normal(0, 0.08, len(time_index))
-        purity = np.clip(base_purity - purity_loss, 95.0, 99.95)
+        if purity_start_level is None:
+            base_purity = 99.85 + np.random.uniform(-0.05, 0.1)
+        else:
+            base_purity = float(purity_start_level)
+
+        purity_loss = amplitude_deviation * 1.2 + np.random.normal(0, 0.08, n)
+
+        time_scalar = np.linspace(0.0, 1.0, n)
+        trend_component = time_scalar * float(purity_trend)
+
+        purity = np.clip(
+            base_purity + trend_component - purity_loss,
+            95.0, 99.99
+        )
 
         stone_count = np.random.poisson(lam=5, size=len(time_index))
         stone_count = stone_count + (amplitude_deviation * 8).astype(int)

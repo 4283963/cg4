@@ -23,6 +23,9 @@ from purity_model import (
     FALLBACK_PURITY_BASE,
     _safe_float,
     _clip_parameters,
+    compute_golden_adjustments,
+    PURITY_THRESHOLD,
+    FUTURE_MINUTES,
 )
 
 app = Flask(__name__)
@@ -493,11 +496,27 @@ def refresh_data():
     warnings = []
     try:
         body = request.get_json(silent=True) or {}
-        qs_val = request.args.get('dirty_ratio')
-        dr_from_body = body.get('dirty_ratio', None)
-        dr_from_qs = float(qs_val) if qs_val is not None else None
-        dirty_ratio = float(dr_from_body if dr_from_body is not None else (dr_from_qs if dr_from_qs is not None else 0.0))
-        data = generate_historical_data(dirty_ratio=dirty_ratio)
+
+        def _get_float(name, default):
+            v = body.get(name)
+            if v is None:
+                v = request.args.get(name)
+            if v is None:
+                return default
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return default
+
+        dirty_ratio = _get_float('dirty_ratio', 0.0)
+        purity_start = _get_float('purity_start_level', None)
+        purity_trend = _get_float('purity_trend', 0.0)
+
+        data = generate_historical_data(
+            dirty_ratio=dirty_ratio,
+            purity_start_level=purity_start,
+            purity_trend=purity_trend,
+        )
 
         train_results = model.train_all()
         for res in train_results:
@@ -507,6 +526,9 @@ def refresh_data():
         payload = {
             'status': 'data_refreshed',
             'records_generated': len(data),
+            'dirty_ratio': dirty_ratio,
+            'purity_start_level': purity_start,
+            'purity_trend': purity_trend,
             'training_results': train_results,
             'timestamp': datetime.now().isoformat(),
         }
@@ -567,6 +589,41 @@ def get_dashboard_data():
         'timestamp': datetime.now().isoformat(),
     }
     return jsonify(_add_degraded_note(payload, warnings))
+
+
+@app.route('/api/golden-adjustments', methods=['GET'])
+def get_golden_adjustments():
+    warnings = []
+    try:
+        hours = request.args.get('hours', 24, type=int)
+        target_raw = request.args.get('target_purity')
+        try:
+            target = float(target_raw) if target_raw is not None else PURITY_THRESHOLD
+        except (TypeError, ValueError):
+            target = PURITY_THRESHOLD
+            warnings.append('INVALID_TARGET_PURITY_FALLBACK')
+
+        result = compute_golden_adjustments(model=model, hours=hours, target_purity=target)
+
+        if result.get('urgent'):
+            warnings.append('PURITY_DROP_IMMINENT: Golden adjustment suggestions issued')
+        if result.get('error'):
+            warnings.append(result['error'])
+
+        return jsonify(_add_degraded_note(result, warnings))
+    except Exception as e:
+        fallback = {
+            'generated_at': datetime.now().isoformat(),
+            'target_purity': PURITY_THRESHOLD,
+            'future_minutes': FUTURE_MINUTES,
+            'urgent': False,
+            'machines_at_risk': [],
+            'energy_plan': [],
+            'speed_plan': [],
+            'summary': f'黄金方案生成异常（降级兜底）：{type(e).__name__}',
+            'error': f'{type(e).__name__}: {str(e)}',
+        }
+        return jsonify(_add_degraded_note(fallback, [f'GOLDEN_ADJ_FALLBACK: {type(e).__name__}: {str(e)}']))
 
 
 if __name__ == '__main__':

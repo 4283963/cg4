@@ -3,6 +3,7 @@ import MachineList from './components/MachineList';
 import PurityCurveChart from './components/PurityCurveChart';
 import HistoryChart from './components/HistoryChart';
 import AmplitudeControlPanel from './components/AmplitudeControlPanel';
+import GoldenAdvicePanel from './components/GoldenAdvicePanel';
 import {
   getAllMachines,
   getMachineDetail,
@@ -189,7 +190,7 @@ function App() {
 
       {error && <div className="error-message">⚠️ {error}</div>}
 
-      <div className="main-grid">
+      <div className="main-grid main-grid--three">
         <MachineList
           machines={machines}
           selectedMachineId={selectedMachineId}
@@ -356,6 +357,8 @@ function App() {
             </div>
           )}
         </div>
+
+        <GoldenAdvicePanel />
       </div>
     </div>
   );

@@ -470,11 +470,323 @@ class PurityPredictionModel:
             }
 
 
+PURITY_THRESHOLD = 99.9
+FUTURE_MINUTES = 30
+
+PARAMETER_ENERGY_COST = {
+    'fan_airflow': 10.0,
+    'vibration_freq': 5.0,
+    'amplitude': 3.0,
+    'inclination_angle': 0.5,
+}
+
+PARAMETER_RESPONSE_SPEED = {
+    'amplitude': 10.0,
+    'vibration_freq': 6.0,
+    'inclination_angle': 5.0,
+    'fan_airflow': 2.0,
+}
+
+PARAM_ADJUST_STEP = {
+    'vibration_freq': 1.0,
+    'inclination_angle': 0.1,
+    'fan_airflow': 50.0,
+    'amplitude': 0.1,
+}
+
+
+def _trend_slope(y_values, window=20):
+    try:
+        y = np.asarray(y_values, dtype=np.float64)
+        y = y[np.isfinite(y)]
+        if len(y) < 3:
+            return 0.0
+        y = y[-window:] if len(y) > window else y
+        x = np.arange(len(y), dtype=np.float64)
+        if np.std(x) < 1e-8 or np.std(y) < 1e-8:
+            return 0.0
+        slope = np.polyfit(x, y, 1)[0]
+        return float(slope)
+    except Exception:
+        return 0.0
+
+
+def _parameter_sensitivity(model, current_params):
+    sensitivity = {}
+    eps = {
+        'vibration_freq': 0.5,
+        'inclination_angle': 0.05,
+        'fan_airflow': 20.0,
+        'amplitude': 0.05,
+    }
+    try:
+        clipped = _clip_parameters(current_params)
+        X_base = np.array([[clipped[c] for c in FEATURE_COLS]], dtype=np.float64)
+        try:
+            y_base = float(np.asarray(model.predict(X_base)).reshape(-1)[0])
+        except Exception:
+            y_base = FALLBACK_PURITY_BASE
+        if not np.isfinite(y_base):
+            y_base = FALLBACK_PURITY_BASE
+
+        for col in FEATURE_COLS:
+            try:
+                X_up = X_base.copy()
+                idx = FEATURE_COLS.index(col)
+                X_up[0, idx] += eps[col]
+                try:
+                    y_up = float(np.asarray(model.predict(X_up)).reshape(-1)[0])
+                except Exception:
+                    y_up = y_base
+                if not np.isfinite(y_up):
+                    y_up = y_base
+                dy = y_up - y_base
+                if abs(dy) < 1e-8:
+                    sensitivity[col] = 0.0
+                else:
+                    sensitivity[col] = float(dy / eps[col])
+            except Exception:
+                sensitivity[col] = 0.0
+    except Exception:
+        for col in FEATURE_COLS:
+            sensitivity[col] = 0.0
+    return sensitivity
+
+
+def _predict_future_purity(purity_series, current_purity, minutes_ahead=FUTURE_MINUTES):
+    try:
+        slope_per_sample = _trend_slope(purity_series)
+        extrapolation = slope_per_sample * max(1, minutes_ahead // 5)
+        future_purity = float(current_purity + extrapolation)
+        if not np.isfinite(future_purity):
+            future_purity = float(current_purity)
+        return float(np.clip(future_purity, 90.0, 99.99)), slope_per_sample
+    except Exception:
+        return float(current_purity), 0.0
+
+
+def _compute_adjustment_plan(machine_id, model, current_params, sensitivity,
+                             current_purity, target_purity=PURITY_THRESHOLD,
+                             priority='energy'):
+    try:
+        clipped = _clip_parameters(current_params)
+        purity_gap = float(target_purity) - float(current_purity)
+        if purity_gap <= 0.0:
+            return None
+
+        if priority == 'energy':
+            param_order = sorted(
+                FEATURE_COLS,
+                key=lambda c: (PARAMETER_ENERGY_COST.get(c, 999),
+                               -abs(sensitivity.get(c, 0.0)))
+            )
+        else:
+            param_order = sorted(
+                FEATURE_COLS,
+                key=lambda c: (-PARAMETER_RESPONSE_SPEED.get(c, 0),
+                               -abs(sensitivity.get(c, 0.0)))
+            )
+
+        actions = []
+        remaining_gap = purity_gap
+        max_iters = 6
+        iterations = 0
+
+        while remaining_gap > 0.001 and iterations < max_iters:
+            iterations += 1
+            advanced = False
+            for col in param_order:
+                s = sensitivity.get(col, 0.0)
+                if abs(s) < 1e-6:
+                    continue
+                step = PARAM_ADJUST_STEP.get(col, 1.0)
+                lo, hi = PARAM_RANGES.get(col, (0.0, 1e9))
+                cur = float(clipped[col])
+
+                best_delta_purity = 0.0
+                best_dir = 0
+                for direction in [+1, -1]:
+                    new_val = cur + direction * step
+                    if new_val < lo - 1e-9 or new_val > hi + 1e-9:
+                        continue
+                    delta_purity = s * direction * step
+                    if delta_purity <= 0.0:
+                        continue
+                    if delta_purity > best_delta_purity:
+                        best_delta_purity = delta_purity
+                        best_dir = direction
+
+                if best_dir == 0:
+                    continue
+
+                apply_steps = 1
+                if abs(best_delta_purity) > 1e-9:
+                    max_possible = min(3, int(np.ceil(remaining_gap / abs(best_delta_purity))))
+                    apply_steps = max(1, min(max_possible, 3))
+
+                total_step = best_dir * step * apply_steps
+                new_val = cur + total_step
+                new_val = max(lo, min(hi, new_val))
+                actual_step = new_val - cur
+
+                if abs(actual_step) < 1e-9:
+                    continue
+
+                actual_delta_purity = s * actual_step
+                if actual_delta_purity <= 0.0:
+                    continue
+
+                clipped[col] = new_val
+                remaining_gap -= actual_delta_purity
+                actions.append({
+                    'parameter': col,
+                    'from_value': round(cur, 4),
+                    'to_value': round(new_val, 4),
+                    'adjustment': round(actual_step, 4),
+                    'expected_purity_improvement': round(min(actual_delta_purity, purity_gap), 4),
+                })
+                advanced = True
+
+                if remaining_gap <= 0.001:
+                    break
+            if not advanced:
+                break
+
+        if not actions:
+            return None
+
+        return {
+            'machine_id': machine_id,
+            'current_purity': round(current_purity, 4),
+            'target_purity': round(target_purity, 4),
+            'purity_gap': round(purity_gap, 4),
+            'actions': actions,
+            'total_expected_improvement': round(
+                sum(a['expected_purity_improvement'] for a in actions), 4
+            ),
+        }
+    except Exception:
+        return None
+
+
 global_model = PurityPredictionModel(degree=2)
 
 
 def get_global_model():
     return global_model
+
+
+def compute_golden_adjustments(model=None, hours=24, target_purity=PURITY_THRESHOLD):
+    if model is None:
+        model = get_global_model()
+
+    result = {
+        'generated_at': None,
+        'target_purity': target_purity,
+        'future_minutes': FUTURE_MINUTES,
+        'urgent': False,
+        'machines_at_risk': [],
+        'energy_plan': [],
+        'speed_plan': [],
+        'summary': None,
+    }
+
+    try:
+        from industrial_db import get_current_parameters, query_machine_data
+        from datetime import datetime
+
+        result['generated_at'] = datetime.now().isoformat()
+
+        machine_data = {}
+        for mid in MACHINE_IDS:
+            try:
+                data_df = query_machine_data(mid, hours=hours)
+                if data_df is None or len(data_df) == 0:
+                    continue
+                purity_series = data_df['purity'].values
+
+                cur_params = get_current_parameters(mid) or {}
+                pred_result = model.predict(mid, cur_params)
+                current_purity = float(pred_result.get('predicted_purity', FALLBACK_PURITY_BASE))
+
+                future_purity, slope = _predict_future_purity(
+                    purity_series, current_purity, minutes_ahead=FUTURE_MINUTES
+                )
+
+                try:
+                    mdl_obj = model.models.get(mid)
+                    if mdl_obj is None:
+                        model.train(mid)
+                        mdl_obj = model.models.get(mid)
+                    sensitivity = _parameter_sensitivity(mdl_obj, cur_params)
+                except Exception:
+                    sensitivity = {c: 0.0 for c in FEATURE_COLS}
+
+                machine_data[mid] = {
+                    'machine_id': mid,
+                    'current_purity': current_purity,
+                    'predicted_30min_purity': round(future_purity, 4),
+                    'purity_slope_per_5min': round(slope, 6),
+                    'current_params': _clip_parameters(cur_params),
+                    'sensitivity': sensitivity,
+                    'at_risk': future_purity < target_purity,
+                    'model_strategy': pred_result.get('model_strategy', 'UNKNOWN'),
+                }
+            except Exception:
+                continue
+
+        at_risk = [m for m in machine_data.values() if m['at_risk']]
+        result['machines_at_risk'] = [
+            {k: v for k, v in m.items() if k not in ['sensitivity', 'current_params']}
+            for m in at_risk
+        ]
+        if at_risk:
+            result['urgent'] = True
+
+        for plan_name, priority in [('energy_plan', 'energy'), ('speed_plan', 'speed')]:
+            plans = []
+            for mid, mdata in machine_data.items():
+                if not mdata['at_risk']:
+                    continue
+                try:
+                    mdl_obj = model.models.get(mid)
+                    adj = _compute_adjustment_plan(
+                        mid,
+                        mdl_obj,
+                        mdata['current_params'],
+                        mdata['sensitivity'],
+                        mdata['predicted_30min_purity'],
+                        target_purity=target_purity,
+                        priority=priority,
+                    )
+                    if adj is not None:
+                        plans.append(adj)
+                except Exception:
+                    continue
+            result[plan_name] = plans
+
+        if at_risk:
+            risk_ids = [m['machine_id'] for m in at_risk]
+            energy_action_count = sum(len(p.get('actions', [])) for p in result['energy_plan'])
+            speed_action_count = sum(len(p.get('actions', [])) for p in result['speed_plan'])
+            worst_purity = min(m['predicted_30min_purity'] for m in at_risk)
+            result['summary'] = (
+                f"检测到 {len(at_risk)} 台去石机（{', '.join(risk_ids)}）"
+                f"预计未来{FUTURE_MINUTES}分钟内纯度跌破 {target_purity}% 阈值 "
+                f"（最低预测 {worst_purity:.2f}%）。已生成 2 组微调方案："
+                f"省电方案共 {energy_action_count} 步操作，省时间方案共 {speed_action_count} 步操作。"
+            )
+        else:
+            result['summary'] = (
+                f"所有机器运行稳定，预测未来{FUTURE_MINUTES}分钟内纯度均保持在 "
+                f"{target_purity}% 以上，当前无需调整。"
+            )
+
+        return result
+    except Exception as e:
+        result['summary'] = f'黄金方案生成异常：{type(e).__name__}: {str(e)}'
+        result['error'] = f'{type(e).__name__}: {str(e)}'
+        return result
 
 
 if __name__ == '__main__':

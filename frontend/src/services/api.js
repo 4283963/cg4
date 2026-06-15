@@ -76,4 +76,10 @@ export const getDashboardData = async () => {
   return response.data;
 };
 
+export const getGoldenAdjustments = async (targetPurity = null) => {
+  const params = targetPurity ? { target_purity: targetPurity } : {};
+  const response = await api.get('/golden-adjustments', { params });
+  return response.data;
+};
+
 export default api;
